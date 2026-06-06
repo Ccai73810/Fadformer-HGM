@@ -177,28 +177,50 @@ def load_pretrained(model, path):
     return model
 
 
-write_progress("Loading pretrained FADformer (baseline)...")
-from models.FADformer import FADformer, FADformer_mini, FADformer_HGM, FADformer_HGM_mini
+latest_ckpt_path = os.path.join(SAVE_DIR, f'FADformer_HGM_latest_{MODEL_SCALE}.pth')
+resume_training = True
+if '--from-scratch' in sys.argv:
+    resume_training = False
 
-if MODEL_SCALE == 'mini':
-    model_orig = FADformer_mini()
-    write_progress("Using FADformer_mini for baseline evaluation")
+baseline_psnr = 0
+has_checkpoint = False
+
+if resume_training and os.path.exists(latest_ckpt_path):
+    try:
+        ckpt = torch.load(latest_ckpt_path, map_location='cpu')
+        if 'baseline_psnr' in ckpt:
+            baseline_psnr = ckpt['baseline_psnr']
+            has_checkpoint = True
+            write_progress(f"Skipping baseline evaluation. Loaded baseline PSNR from checkpoint: {baseline_psnr:.2f} dB")
+    except Exception as e:
+        write_progress(f"Could not read checkpoint to skip baseline ({e}).")
+
+if not has_checkpoint:
+    write_progress("Loading pretrained FADformer (baseline)...")
+    from models.FADformer import FADformer, FADformer_mini, FADformer_HGM, FADformer_HGM_mini
+
+    if MODEL_SCALE == 'mini':
+        model_orig = FADformer_mini()
+        write_progress("Using FADformer_mini for baseline evaluation")
+    else:
+        model_orig = FADformer()
+        write_progress("Using FADformer (full) for baseline evaluation")
+    params_orig = sum(p.numel() for p in model_orig.parameters())
+    write_progress(f"Baseline FADformer size: {params_orig/1e6:.2f}M params")
+
+    model_orig = load_pretrained(model_orig, PRETRAINED)
+    model_orig = model_orig.to(device)
+    model_orig.eval()
+
+    write_progress("Evaluating baseline on Rain200H test set...")
+    baseline_psnr = validate(model_orig, test_loader)
+    write_progress(f"Pretrained FADformer PSNR on Rain200H test: {baseline_psnr:.2f} dB")
+
+    del model_orig
+    torch.cuda.empty_cache()
 else:
-    model_orig = FADformer()
-    write_progress("Using FADformer (full) for baseline evaluation")
-params_orig = sum(p.numel() for p in model_orig.parameters())
-write_progress(f"Baseline FADformer size: {params_orig/1e6:.2f}M params")
+    from models.FADformer import FADformer, FADformer_mini, FADformer_HGM, FADformer_HGM_mini
 
-model_orig = load_pretrained(model_orig, PRETRAINED)
-model_orig = model_orig.to(device)
-model_orig.eval()
-
-write_progress("Evaluating baseline on Rain200H test set...")
-baseline_psnr = validate(model_orig, test_loader)
-write_progress(f"Pretrained FADformer PSNR on Rain200H test: {baseline_psnr:.2f} dB")
-
-del model_orig
-torch.cuda.empty_cache()
 
 if MODEL_SCALE == 'mini':
     write_progress("Creating FADformer_HGM_mini...")
