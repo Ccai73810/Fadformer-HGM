@@ -309,15 +309,28 @@ for epoch in range(start_epoch + 1, EPOCHS + 1):
         loss = criterion(output, target) / ACCUMULATION
 
         if torch.isnan(loss):
-            write_progress(f"Error: NaN loss detected at E{epoch} batch {batch_idx+1}! Terminating.")
-            raise RuntimeError(f"NaN loss detected at E{epoch} batch {batch_idx+1}")
+            write_progress(f"Warning: NaN loss detected at E{epoch} batch {batch_idx+1}. Skipping batch to protect model weights.")
+            optimizer.zero_grad()
+            continue
 
         loss.backward()
 
         if (batch_idx + 1) % ACCUMULATION == 0:
             torch.nn.utils.clip_grad_norm_(model_hgm.parameters(), 0.01)
-            optimizer.step()
-            optimizer.zero_grad()
+            
+            # 检测梯度中是否含有 NaN，如果有则跳过更新步，防止污染模型权重
+            has_nan_grad = False
+            for param in model_hgm.parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    has_nan_grad = True
+                    break
+            
+            if has_nan_grad:
+                write_progress(f"Warning: NaN gradient detected at E{epoch} batch {batch_idx+1}. Skipping optimizer step to protect weights.")
+                optimizer.zero_grad()
+            else:
+                optimizer.step()
+                optimizer.zero_grad()
 
         epoch_loss += loss.item() * ACCUMULATION
 
