@@ -124,7 +124,12 @@ def validate(model, loader):
         for batch in loader:
             source = batch['source'].to(device)
             target = batch['target'].to(device)
-            output = model(source).clamp_(0, 1)
+            if AMP_NEW:
+                with autocast('cuda'):
+                    output = model(source).clamp_(0, 1)
+            else:
+                with autocast():
+                    output = model(source).clamp_(0, 1)
             total_psnr += calc_psnr(output, target)
             count += 1
     return total_psnr / count if count > 0 else 0
