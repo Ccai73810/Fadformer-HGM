@@ -118,20 +118,19 @@ def calc_psnr(img1, img2):
 
 def validate(model, loader):
     model.eval()
+    # 暂时将模型移到 CPU 进行评估，彻底解决 GPU 上 FFT 在 FP32 下的计算偏差和 FP16 下的 NaN 溢出问题
+    model.to('cpu')
     total_psnr = 0
     count = 0
     with torch.no_grad():
         for batch in loader:
-            source = batch['source'].to(device)
-            target = batch['target'].to(device)
-            if AMP_NEW:
-                with autocast('cuda'):
-                    output = model(source).clamp_(0, 1)
-            else:
-                with autocast():
-                    output = model(source).clamp_(0, 1)
+            source = batch['source'].to('cpu')
+            target = batch['target'].to('cpu')
+            output = model(source).clamp_(0, 1)
             total_psnr += calc_psnr(output, target)
             count += 1
+    # 评估完成后，将模型移回 GPU，以供后续训练使用
+    model.to(device)
     return total_psnr / count if count > 0 else 0
 
 
