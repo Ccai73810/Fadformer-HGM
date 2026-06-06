@@ -29,7 +29,7 @@ PRETRAINED = './pretrain_weights/rain200H/FADformer_Rain200H.pth'
 EPOCHS = 300
 BATCH_SIZE = 2  # 减小 Batch Size 防止显存 OOM
 IMG_SIZE = 256  # 保持 256x256 完整分辨率以确保高复原质量
-LR = 1e-3
+LR = 2e-4  # 使用较低的 2e-4 学习率配合 Warmup，避免破坏预训练权重导致 NaN
 ACCUMULATION = 8  # 相应增加梯度累积步数，维持有效 Batch Size = 16 不变
 
 # 模型规模选择: 'mini' (轻量版, 2.38M) 或 'full' (全量版, 9.87M)
@@ -214,28 +214,73 @@ else:
 model_hgm = load_pretrained(model_hgm, PRETRAINED)
 model_hgm = model_hgm.to(device)
 optimizer = optim.AdamW(model_hgm.parameters(), lr=LR, weight_decay=1e-2)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+
+WARMUP_EPOCHS = 3
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS - WARMUP_EPOCHS, eta_min=1e-6)
 criterion = nn.L1Loss()
 scaler = GradScaler('cuda') if AMP_NEW else GradScaler()
 
 best_psnr = 0
+start_epoch = 0
 train_start = time.time()
 
-with open(log_path, 'w') as f:
-    f.write(f"Rain200H HGM Training Log\n")
-    f.write(f"Baseline PSNR: {baseline_psnr:.2f} dB\n")
-    f.write(f"Model params: {params_hgm/1e6:.2f}M\n\n")
-    f.flush()
-    os.fsync(f.fileno())
+# --- 断点续训 (Resume Training) 机制 ---
+latest_ckpt_path = os.path.join(SAVE_DIR, f'FADformer_HGM_latest_{MODEL_SCALE}.pth')
+resume_training = True
+if '--from-scratch' in sys.argv:
+    resume_training = False
+    write_progress("Forced training from scratch due to '--from-scratch' flag.")
+
+if resume_training and os.path.exists(latest_ckpt_path):
+    try:
+        write_progress(f"Found latest checkpoint {latest_ckpt_path}. Loading and resuming...")
+        ckpt = torch.load(latest_ckpt_path, map_location='cpu')
+        model_hgm.load_state_dict(ckpt['model_state_dict'])
+        
+        if 'optimizer_state_dict' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device)
+        
+        if 'scheduler_state_dict' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            
+        start_epoch = ckpt.get('epoch', 0)
+        best_psnr = ckpt.get('psnr', 0)
+        baseline_psnr = ckpt.get('baseline_psnr', baseline_psnr)
+        write_progress(f"Successfully resumed from epoch {start_epoch} with best PSNR: {best_psnr:.2f} dB")
+    except Exception as e:
+        write_progress(f"Warning: failed to resume from checkpoint ({e}). Starting from epoch 0.")
+
+if start_epoch == 0:
+    with open(log_path, 'w') as f:
+        f.write(f"Rain200H HGM Training Log\n")
+        f.write(f"Baseline PSNR: {baseline_psnr:.2f} dB\n")
+        f.write(f"Model params: {params_hgm/1e6:.2f}M\n\n")
+        f.flush()
+        os.fsync(f.fileno())
+else:
+    write_log(f"\n--- Resumed training from epoch {start_epoch} ---")
 
 total_batches = len(train_loader)
 write_progress(f"Starting training: {EPOCHS} epochs, {total_batches} batches/epoch")
 
-for epoch in range(1, EPOCHS + 1):
+for epoch in range(start_epoch + 1, EPOCHS + 1):
     model_hgm.train()
     epoch_loss = 0
     optimizer.zero_grad()
     epoch_start = time.time()
+
+    # 渐进式学习率 Warmup，防止初始梯度爆炸破坏预训练权重
+    if epoch <= WARMUP_EPOCHS and start_epoch == 0:
+        warmup_lr = (epoch / WARMUP_EPOCHS) * LR
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = warmup_lr
+        current_lr = warmup_lr
+    else:
+        current_lr = optimizer.param_groups[0]['lr']
 
     for batch_idx, batch in enumerate(train_loader):
         source = batch['source'].to(device)
@@ -261,7 +306,10 @@ for epoch in range(1, EPOCHS + 1):
             elapsed_b = time.time() - epoch_start
             write_progress(f"E{epoch} batch {batch_idx+1}/{total_batches} loss={loss.item()*ACCUMULATION:.4f} {elapsed_b:.0f}s")
 
-    scheduler.step()
+    # 更新学习率调度器
+    if epoch > WARMUP_EPOCHS or start_epoch > 0:
+        scheduler.step()
+        
     avg_loss = epoch_loss / total_batches
     current_lr = optimizer.param_groups[0]['lr']
     epoch_time = time.time() - epoch_start
@@ -278,6 +326,8 @@ for epoch in range(1, EPOCHS + 1):
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model_hgm.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'psnr': best_psnr,
                 'loss': avg_loss,
                 'baseline_psnr': baseline_psnr,
@@ -293,10 +343,23 @@ for epoch in range(1, EPOCHS + 1):
         write_progress(msg)
         write_log(msg)
 
+    # 每个 epoch 结束都保存最新的 checkpoint 供断点续训
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model_hgm.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'psnr': best_psnr,
+        'loss': avg_loss,
+        'baseline_psnr': baseline_psnr,
+    }, os.path.join(SAVE_DIR, f'FADformer_HGM_latest_{MODEL_SCALE}.pth'))
+
     if epoch % 50 == 0:
         torch.save({
             'epoch': epoch,
             'model_state_dict': model_hgm.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
             'psnr': best_psnr,
             'loss': avg_loss,
             'baseline_psnr': baseline_psnr,
@@ -311,7 +374,7 @@ model_orig = load_pretrained(model_orig, PRETRAINED)
 model_orig = model_orig.to(device)
 model_orig.eval()
 
-ckpt_hgm = torch.load(os.path.join(SAVE_DIR, 'FADformer_HGM_best.pth'), map_location=device)
+ckpt_hgm = torch.load(os.path.join(SAVE_DIR, f'FADformer_HGM_best_{MODEL_SCALE}.pth'), map_location=device)
 model_hgm.load_state_dict(ckpt_hgm['model_state_dict'])
 model_hgm.eval()
 
