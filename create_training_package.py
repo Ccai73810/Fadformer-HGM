@@ -17,6 +17,7 @@ shutil.copy(os.path.join(base_dir, 'models', '__init__.py'), os.path.join(pkg_di
 shutil.copy(os.path.join(base_dir, 'models', 'FADformer.py'), os.path.join(pkg_dir, 'models', 'FADformer.py'))
 shutil.copy(os.path.join(base_dir, 'models', 'HGM.py'), os.path.join(pkg_dir, 'models', 'HGM.py'))
 shutil.copy(os.path.join(base_dir, 'models', 'FCR.py'), os.path.join(pkg_dir, 'models', 'FCR.py'))
+shutil.copy(os.path.join(base_dir, 'models', 'GP_HGM_plus.py'), os.path.join(pkg_dir, 'models', 'GP_HGM_plus.py'))
 
 # 3. Copy dataset files
 shutil.copy(os.path.join(base_dir, 'datasets', '__init__.py'), os.path.join(pkg_dir, 'datasets', '__init__.py'))
@@ -30,6 +31,7 @@ shutil.copy(os.path.join(base_dir, 'utils', 'data_parallel.py'), os.path.join(pk
 
 # 5. Copy training script and diagnosis tool
 shutil.copy(os.path.join(base_dir, 'train_rain200h.py'), os.path.join(pkg_dir, 'train_rain200h.py'))
+shutil.copy(os.path.join(base_dir, 'train_rain200l_gphgm_plus.py'), os.path.join(pkg_dir, 'train_rain200l_gphgm_plus.py'))
 shutil.copy(os.path.join(base_dir, 'diagnose_baseline.py'), os.path.join(pkg_dir, 'diagnose_baseline.py'))
 
 # 6. Generate requirements.txt

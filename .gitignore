@@ -1,0 +1,32 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints and large binaries
+*.pth
+*.zip
+*.tar
+*.gz
+
+# Ignore weights and datasets
+pretrain_weights/
+saved_models/
+Rain200L/
+Rain200H/
+data_list/
+HGM_Training_Package/
+
+# Python environment packages used locally for evaluation
+eval_pkgs/
+
+# Local IDE and editor configurations
+.trae/
+.vscode/
+.idea/
+
+# Output demo visuals
+demo/hgm_best_server_results/
+demo/hgm_results/
+demo/output_comparison/
+demo/output_result/
