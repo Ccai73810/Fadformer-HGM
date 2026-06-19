@@ -14,12 +14,26 @@ import numpy as np
 # Setup path
 sys.path.insert(0, os.path.abspath('.'))
 
+def find_dataset_dir(dataset_name):
+    candidates = [
+        # Local Windows Baidu Download paths
+        os.path.join(r'D:\BaiduNetdiskDownload', dataset_name, dataset_name),
+        os.path.join(r'D:\BaiduNetdiskDownload', dataset_name),
+        # Relative paths
+        os.path.join('.', dataset_name),
+        os.path.join('..', dataset_name),
+    ]
+    for path in candidates:
+        if os.path.exists(path) and os.path.exists(os.path.join(path, 'test', 'input')):
+            return os.path.abspath(path)
+    return None
+
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Visualization script running on: {device}")
     
     # Paths
-    dataset_dir = './Rain200L'
+    dataset_dir = find_dataset_dir('Rain200L')
     ckpt_path = './saved_models/rain200l_gphgm_plus/GP_HGM_plus_best_mini.pth'
     output_dir = './comparison_results'
     
@@ -28,18 +42,9 @@ def main():
         print("Please make sure you have successfully downloaded the weights from the server using SCP.")
         sys.exit(1)
         
-    if not os.path.exists(os.path.join(dataset_dir, 'test', 'input')):
-        # Try parent folder candidates
-        alternative_dirs = ['./Rain200L', '../Rain200L']
-        found = False
-        for alt in alternative_dirs:
-            if os.path.exists(os.path.join(alt, 'test', 'input')):
-                dataset_dir = alt
-                found = True
-                break
-        if not found:
-            print(f"Error: Rain200L test dataset directory not found.")
-            sys.exit(1)
+    if dataset_dir is None:
+        print(f"Error: Rain200L test dataset directory not found in candidate paths.")
+        sys.exit(1)
             
     os.makedirs(output_dir, exist_ok=True)
     
