@@ -58,6 +58,9 @@ def main():
     new_state = {}
     for k, v in state.items():
         name = k.replace('module.', '') if k.startswith('module.') else k
+        # Map old sequential film layers to new linear layers
+        name = name.replace('fc.0.weight', 'fc.weight')
+        name = name.replace('fc.0.bias', 'fc.bias')
         new_state[name] = v
         
     model.load_state_dict(new_state)
