@@ -32,7 +32,6 @@ shutil.copy(os.path.join(base_dir, 'utils', 'data_parallel.py'), os.path.join(pk
 # 5. Copy training script and diagnosis tool
 shutil.copy(os.path.join(base_dir, 'train_rain200h.py'), os.path.join(pkg_dir, 'train_rain200h.py'))
 shutil.copy(os.path.join(base_dir, 'train_rain200l_gphgm_plus.py'), os.path.join(pkg_dir, 'train_rain200l_gphgm_plus.py'))
-shutil.copy(os.path.join(base_dir, 'diagnose_baseline.py'), os.path.join(pkg_dir, 'diagnose_baseline.py'))
 
 # 6. Generate requirements.txt
 req_content = """torch>=1.10.0

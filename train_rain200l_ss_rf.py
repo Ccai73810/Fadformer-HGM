@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-GP-HGM++ Rain200L Training and Fine-tuning Script
-Implements the 3-Stage Training Pipeline for Lightweight Generative Prior Restoration
+SS-RF: Spectral-Spatial Rectified Flow Training and Fine-tuning Script
+Implements the Mathematically Constrained Flow Restoration Pipeline on Rain200L
 """
 
 import os
@@ -9,6 +9,7 @@ import sys
 import time
 import random
 import argparse
+import copy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,7 +28,6 @@ except ImportError:
     from torch.cuda.amp import autocast, GradScaler
     AMP_NEW = False
 
-# Wrap autocast for backward compatibility in PyTorch versions (e.g. 2.0.1 on server)
 if not AMP_NEW:
     _autocast = autocast
     class autocast_compat(_autocast):
@@ -35,18 +35,17 @@ if not AMP_NEW:
             super().__init__(*args, **kwargs)
     autocast = autocast_compat
 
-from models.FADformer import FADformer, FADformer_mini
-from models.GP_HGM_plus import GP_HGM_mini, GP_HGM_full
+from models.SS_RF_Model import SS_RF_mini, SS_RF_full
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train GP-HGM++ on Rain200L")
+    parser = argparse.ArgumentParser(description="Train SS-RF on Rain200L")
     
     # Dataset and paths
     parser.add_argument('--data_dir', type=str, default='./Rain200L',
                         help='Path to the Rain200L dataset (default: ./Rain200L)')
-    parser.add_argument('--save_dir', type=str, default='./saved_models/rain200l_gphgm_plus',
+    parser.add_argument('--save_dir', type=str, default='./saved_models/rain200l_ss_rf',
                         help='Directory to save checkpoints')
-    parser.add_argument('--pretrained', type=str, default='./saved_models/rain200l_real/FADformer_orig_best.pth',
+    parser.add_argument('--pretrained', type=str, default='./saved_models/rain200l_real/FADformer_HGM_best_mini.pth',
                         help='Path to pretrained FADformer backbone weights')
     
     # Model configuration
@@ -60,6 +59,18 @@ def parse_args():
                         help='Number of heads for HGM sparse attention (default: 4)')
     parser.add_argument('--fusion_mode', type=str, default='gate', choices=['gate', 'sum', 'learnable'],
                         help='Feature fusion mode for HGM (default: gate)')
+    
+    # Loss Hyper-parameters (SS-RF Constraints)
+    parser.add_argument('--lambda1', type=float, default=0.5,
+                        help='Weight for spatial flow alignment loss (default: 0.5)')
+    parser.add_argument('--lambda2', type=float, default=0.1,
+                        help='Weight for spectral flow alignment loss (default: 0.1)')
+    parser.add_argument('--lambda3', type=float, default=0.1,
+                        help='Weight for prior trajectory invariance loss (default: 0.1)')
+    parser.add_argument('--gamma', type=float, default=0.1,
+                        help='Weight for spectral reconstruction loss (default: 0.1)')
+    parser.add_argument('--beta', type=float, default=0.1,
+                        help='Weight for phase flow difference wrapping factor (default: 0.1)')
     
     # Training hyper-parameters
     parser.add_argument('--epochs', type=int, default=100,
@@ -111,7 +122,6 @@ class RainDataset(Dataset):
         inp = Image.open(os.path.join(self.input_dir, fname)).convert('RGB')
         tgt = Image.open(os.path.join(self.target_dir, fname)).convert('RGB')
         
-        # Random Crop for training, Center Crop/Resize for testing
         w, h = inp.size
         if w < self.img_size or h < self.img_size:
             scale = max(self.img_size / w, self.img_size / h)
@@ -136,8 +146,46 @@ def calc_psnr(img1, img2):
         return float('inf')
     return (10 * torch.log10(1.0 / mse)).item()
 
+def compute_spec_flow_loss(v_theta, target_u, beta=0.1):
+    """
+    Computes L1 spectral loss on both Amplitude and phase-wrapped angle domain.
+    """
+    fft_v = torch.fft.rfft2(v_theta, norm='ortho')
+    fft_u = torch.fft.rfft2(target_u, norm='ortho')
+    
+    amp_v = torch.abs(fft_v)
+    amp_u = torch.abs(fft_u)
+    loss_amp = torch.mean(torch.abs(amp_v - amp_u))
+    
+    # Phase difference wrapping onto [-pi, pi] using circular distance
+    phase_v = torch.angle(fft_v)
+    phase_u = torch.angle(fft_u)
+    phase_diff = torch.atan2(torch.sin(phase_v - phase_u), torch.cos(phase_v - phase_u))
+    loss_phase = torch.mean(torch.abs(phase_diff))
+    
+    return loss_amp + beta * loss_phase
+
+def compute_recon_loss(pred_clean, target_clean, gamma=0.1):
+    """
+    Joint Spatial and Spectral Reconstruction loss.
+    """
+    loss_spatial = torch.mean(torch.abs(pred_clean - target_clean))
+    
+    fft_pred = torch.fft.rfft2(pred_clean, norm='ortho')
+    fft_target = torch.fft.rfft2(target_clean, norm='ortho')
+    loss_spectral = torch.mean(torch.abs(torch.abs(fft_pred) - torch.abs(fft_target)))
+    
+    return loss_spatial + gamma * loss_spectral
+
 def validate(model, loader, device):
-    model.eval()
+    """
+    Validation step using the exact mathematical reparameterization (switch_to_deploy)
+    to verify actual inference-time performance.
+    """
+    fused_model = copy.deepcopy(model)
+    fused_model.switch_to_deploy()
+    fused_model.eval()
+    
     total_psnr = 0
     count = 0
     with torch.no_grad():
@@ -145,7 +193,7 @@ def validate(model, loader, device):
             source = batch['source'].to(device)
             target = batch['target'].to(device)
             with autocast(enabled=torch.cuda.is_available()):
-                output = model(source).clamp_(0, 1)
+                output = fused_model(source).clamp_(0, 1)
             total_psnr += calc_psnr(output, target)
             count += 1
     return total_psnr / count if count > 0 else 0
@@ -158,14 +206,7 @@ def load_pretrained(model, path, logger):
 
     ckpt = torch.load(path, map_location='cpu')
     if isinstance(ckpt, dict):
-        if 'params' in ckpt:
-            state = ckpt['params']
-        elif 'state_dict' in ckpt:
-            state = ckpt['state_dict']
-        elif 'model_state_dict' in ckpt:
-            state = ckpt['model_state_dict']
-        else:
-            state = ckpt
+        state = ckpt.get('params', ckpt.get('state_dict', ckpt.get('model_state_dict', ckpt)))
     else:
         state = ckpt
 
@@ -175,14 +216,12 @@ def load_pretrained(model, path, logger):
     
     for k, v in state.items():
         name = k.replace('module.', '') if k.startswith('module.') else k
-        # Map original backbone keys to GP_HGM_Model's backbone
-        if not name.startswith('backbone.') and not name.startswith('deg_encoder') and not name.startswith('film'):
+        if not name.startswith('backbone.') and not name.startswith('deg_encoder') and not name.startswith('sdm'):
             mapped_name = f'backbone.{name}'
         else:
             mapped_name = name
             
         if mapped_name in model_state:
-            # Check shape compatibility
             if model_state[mapped_name].shape == v.shape:
                 new_state[mapped_name] = v
             else:
@@ -192,13 +231,25 @@ def load_pretrained(model, path, logger):
         logger(f"Shape Mismatch: Filtered out {len(mismatched_keys)} keys due to shape difference")
 
     result = model.load_state_dict(new_state, strict=False)
-    
-    missing = [k for k in result.missing_keys if not any(x in k.lower() for x in ['hgm', 'sparse', 'window', 'deg_encoder', 'film', 'gate'])]
+    missing = [k for k in result.missing_keys if not any(x in k.lower() for x in ['hgm', 'sparse', 'window', 'deg_encoder', 'sdm', 'gate'])]
     if missing:
         logger(f"Warning: missing backbone keys in checkpoint: {missing[:5]}...")
         
     logger(f"Successfully loaded {len(new_state)}/{len(model_state)} parameters from pretrained weights")
     return model
+
+def print_reparam_stats(model, logger):
+    """Prints size statistics before and after structural reparameterization"""
+    params_train = sum(p.numel() for p in model.parameters())
+    
+    model_copy = copy.deepcopy(model)
+    model_copy.switch_to_deploy()
+    params_deploy = sum(p.numel() for p in model_copy.parameters())
+    
+    logger(f"Reparameterization Statistics:")
+    logger(f"  - Training (multi-branch) params: {params_train/1e6:.4f}M")
+    logger(f"  - Deployment (fused) params:     {params_deploy/1e6:.4f}M")
+    logger(f"  - Parameter reduction:            {(params_train - params_deploy)/1e3:.2f}K ({100*(params_train - params_deploy)/params_train:.2f}%)")
 
 def main():
     args = parse_args()
@@ -206,7 +257,7 @@ def main():
     
     os.makedirs(args.save_dir, exist_ok=True)
     progress_path = os.path.join(args.save_dir, 'progress.txt')
-    log_path = os.path.join(args.save_dir, 'GP_HGM_plus_train_log.txt')
+    log_path = os.path.join(args.save_dir, 'SS_RF_train_log.txt')
     
     def write_progress(msg):
         print(msg)
@@ -221,11 +272,10 @@ def main():
             f.flush()
             os.fsync(f.fileno())
 
-    # Clear progress log at start
     with open(progress_path, 'w', encoding='utf-8') as f:
         f.write("")
 
-    write_progress(f"=== GP-HGM++ Rain200L Training Script ===")
+    write_progress(f"=== SS-RF (Spectral-Spatial Rectified Flow) Training ===")
     write_progress(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -246,18 +296,16 @@ def main():
         return
 
     # 2. Instantiate Target Model
-    write_progress(f"Configuring GP-HGM++ model (scale={args.model_scale}, latent_dim={args.latent_dim})...")
-    
+    write_progress(f"Configuring SS-RF model (scale={args.model_scale}, latent_dim={args.latent_dim})...")
     if args.model_scale == 'mini':
-        model_hgm = GP_HGM_mini(latent_dim=args.latent_dim, window_size=args.window_size, num_heads=args.num_heads, fusion_mode=args.fusion_mode)
+        model = SS_RF_mini(latent_dim=args.latent_dim, window_size=args.window_size, num_heads=args.num_heads, fusion_mode=args.fusion_mode)
     else:
-        model_hgm = GP_HGM_full(latent_dim=args.latent_dim, window_size=args.window_size, num_heads=args.num_heads, fusion_mode=args.fusion_mode)
-            
-    params_hgm = sum(p.numel() for p in model_hgm.parameters())
-    write_progress(f"Target GP-HGM++ model size: {params_hgm/1e6:.2f}M params")
+        model = SS_RF_full(latent_dim=args.latent_dim, window_size=args.window_size, num_heads=args.num_heads, fusion_mode=args.fusion_mode)
+    
+    print_reparam_stats(model, write_progress)
 
     baseline_psnr = 0.0
-    latest_ckpt_path = os.path.join(args.save_dir, f'GP_HGM_plus_latest_{args.model_scale}.pth')
+    latest_ckpt_path = os.path.join(args.save_dir, f'SS_RF_latest_{args.model_scale}.pth')
     resume_training = not args.no_resume
     
     has_checkpoint = False
@@ -273,18 +321,16 @@ def main():
     if not has_checkpoint:
         if not args.from_scratch:
             write_progress("Initializing target model backbone with pretrained weights...")
-            model_hgm = load_pretrained(model_hgm, args.pretrained, write_progress)
+            model = load_pretrained(model, args.pretrained, write_progress)
         else:
             write_progress("Training from scratch. Baseline PSNR set to 0.0.")
             baseline_psnr = 0.0
 
-    model_hgm = model_hgm.to(device)
+    model = model.to(device)
     
-    # Setup optimizer, scheduler, criterion, scaler
-    optimizer = optim.AdamW(model_hgm.parameters(), lr=args.lr, weight_decay=1e-2)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     WARMUP_EPOCHS = 3
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs - WARMUP_EPOCHS, eta_min=1e-6)
-    criterion = nn.L1Loss()
     scaler = GradScaler('cuda') if AMP_NEW and torch.cuda.is_available() else None
 
     best_psnr = 0.0
@@ -295,7 +341,7 @@ def main():
         try:
             write_progress(f"Resuming training from latest checkpoint: {latest_ckpt_path}...")
             ckpt = torch.load(latest_ckpt_path, map_location='cpu')
-            model_hgm.load_state_dict(ckpt['model_state_dict'])
+            model.load_state_dict(ckpt['model_state_dict'])
             if 'optimizer_state_dict' in ckpt:
                 optimizer.load_state_dict(ckpt['optimizer_state_dict'])
                 for state in optimizer.state.values():
@@ -313,33 +359,38 @@ def main():
 
     if start_epoch == 0:
         with open(log_path, 'w', encoding='utf-8') as f:
-            f.write(f"Rain200L GP-HGM++ Training Log\n")
-            f.write(f"Model params: {params_hgm/1e6:.2f}M\n")
+            f.write(f"Rain200L SS-RF (Rectified Flow) Training Log\n")
             f.write(f"Configuration: lr={args.lr}, epochs={args.epochs}, batch_size={args.batch_size}\n\n")
 
     total_batches = len(train_loader)
     write_progress(f"Starting 3-stage training loop: {args.epochs} epochs, {total_batches} batches/epoch")
 
     for epoch in range(start_epoch + 1, args.epochs + 1):
-        model_hgm.train()
+        model.train()
         epoch_loss = 0
         optimizer.zero_grad()
         epoch_start = time.time()
 
-        # 3-Stage Training Logic (Backbone kept frozen to prevent gradient washout)
+        # 3-Stage Training Logic for Freezing/Unfreezing Parameters
         stage_desc = ""
         if epoch <= 10:
-            stage_desc = "[Stage 1: Train z encoder + FiLM (Backbone Frozen)]"
+            stage_desc = "[Stage 1: Train Prior Encoder (Rep-DE) + Modulator (SDM) (Backbone Frozen)]"
+            for name, param in model.named_parameters():
+                if 'deg_encoder' in name or 'sdm' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
         elif epoch <= 20:
-            stage_desc = "[Stage 2: Train z encoder + FiLM (Backbone Frozen)]"
+            stage_desc = "[Stage 2: Unfreeze Layer 3/5 (Deep Modulation Stages)]"
+            for name, param in model.named_parameters():
+                if 'deg_encoder' in name or 'sdm' in name or 'layer3' in name or 'layer5' in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
         else:
-            stage_desc = "[Stage 3: Train z encoder + FiLM (Backbone Frozen) + Latent Consistency]"
-
-        for name, param in model_hgm.named_parameters():
-            if 'deg_encoder' in name or 'film' in name:
+            stage_desc = "[Stage 3: Full Unfreeze + Dual-Spectral Flow Matching Constraints]"
+            for param in model.parameters():
                 param.requires_grad = True
-            else:
-                param.requires_grad = False
 
         write_progress(f"--- Epoch {epoch} {stage_desc} ---")
 
@@ -354,30 +405,52 @@ def main():
         for batch_idx, batch in enumerate(train_loader):
             source = batch['source'].to(device)
             target = batch['target'].to(device)
+            B = source.size(0)
+
+            # Sample trajectory factors t1, t2 ~ U(0,1) for trajectory flow constraints
+            t1 = torch.rand(B, 1, 1, 1, device=device)
+            t2 = torch.rand(B, 1, 1, 1, device=device)
+            
+            # Construct probability flow intermediate points
+            X_t1 = (1.0 - t1) * source + t1 * target
+            X_t2 = (1.0 - t2) * source + t2 * target
+            target_u = target - source  # Constant drift vector field
 
             if scaler is not None:
                 with autocast(enabled=torch.cuda.is_available()):
-                    if epoch > 20: # Stage 3: Add latent consistency loss
-                        out, z1 = model_hgm(source, return_z=True)
-                        with torch.no_grad():
-                            _, z2 = model_hgm(torch.flip(source, [3]), return_z=True)
-                        loss_recon = criterion(out, target)
-                        loss_consist = nn.MSELoss()(z1, z2)
-                        loss = (loss_recon + 0.1 * loss_consist) / args.accumulation
-                    else:
-                        out = model_hgm(source)
-                        loss = criterion(out, target) / args.accumulation
+                    # Forward intermediate steps
+                    v_theta_t1, z_t1 = model(X_t1, return_z=True)
+                    v_theta_t2, z_t2 = model(X_t2, return_z=True)
+                    
+                    # Compute constraints
+                    loss_flow_align = nn.L1Loss()(v_theta_t1, target_u)
+                    loss_spec_flow = compute_spec_flow_loss(v_theta_t1, target_u, beta=args.beta)
+                    loss_prior_inv = nn.MSELoss()(z_t1, z_t2)
+                    
+                    # Absolute endpoint reconstruction (t=0 prediction)
+                    pred_clean = model(source)
+                    loss_recon = compute_recon_loss(pred_clean, target, gamma=args.gamma)
+                    
+                    # Combined Loss
+                    loss = (loss_recon + 
+                            args.lambda1 * loss_flow_align + 
+                            args.lambda2 * loss_spec_flow + 
+                            args.lambda3 * loss_prior_inv) / args.accumulation
             else:
-                if epoch > 20:
-                    out, z1 = model_hgm(source, return_z=True)
-                    with torch.no_grad():
-                        _, z2 = model_hgm(torch.flip(source, [3]), return_z=True)
-                    loss_recon = criterion(out, target)
-                    loss_consist = nn.MSELoss()(z1, z2)
-                    loss = (loss_recon + 0.1 * loss_consist) / args.accumulation
-                else:
-                    out = model_hgm(source)
-                    loss = criterion(out, target) / args.accumulation
+                v_theta_t1, z_t1 = model(X_t1, return_z=True)
+                v_theta_t2, z_t2 = model(X_t2, return_z=True)
+                
+                loss_flow_align = nn.L1Loss()(v_theta_t1, target_u)
+                loss_spec_flow = compute_spec_flow_loss(v_theta_t1, target_u, beta=args.beta)
+                loss_prior_inv = nn.MSELoss()(z_t1, z_t2)
+                
+                pred_clean = model(source)
+                loss_recon = compute_recon_loss(pred_clean, target, gamma=args.gamma)
+                
+                loss = (loss_recon + 
+                        args.lambda1 * loss_flow_align + 
+                        args.lambda2 * loss_spec_flow + 
+                        args.lambda3 * loss_prior_inv) / args.accumulation
 
             if torch.isnan(loss):
                 optimizer.zero_grad()
@@ -391,12 +464,12 @@ def main():
             if (batch_idx + 1) % args.accumulation == 0:
                 if scaler is not None:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model_hgm.parameters(), 0.01)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.01)
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model_hgm.parameters(), 0.01)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.01)
                     optimizer.step()
                     optimizer.zero_grad()
 
@@ -414,27 +487,28 @@ def main():
         epoch_time = time.time() - epoch_start
         write_progress(f"E{epoch} completed: loss={avg_loss:.4f} lr={current_lr:.1e} time={epoch_time:.0f}s")
 
+        # Validation step
         if epoch % args.eval_freq == 0 or epoch == 1 or epoch == args.epochs:
-            write_progress(f"Validating epoch {epoch}...")
-            val_psnr = validate(model_hgm, test_loader, device)
+            write_progress(f"Validating epoch {epoch} (using reparameterized fused model)...")
+            val_psnr = validate(model, test_loader, device)
             improved = ""
             
             if val_psnr > best_psnr:
                 best_psnr = val_psnr
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': model_hgm.state_dict(),
+                    'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
                     'psnr': best_psnr,
                     'loss': avg_loss,
                     'baseline_psnr': baseline_psnr,
-                }, os.path.join(args.save_dir, f'GP_HGM_plus_best_{args.model_scale}.pth'))
+                }, os.path.join(args.save_dir, f'SS_RF_best_{args.model_scale}.pth'))
                 improved = " *BEST*"
 
             elapsed = time.time() - train_start
             mem = torch.cuda.memory_allocated(0) / 1024**3 if torch.cuda.is_available() else 0
-            msg = (f"GP-HGM++ E{epoch:3d}/{args.epochs} | Loss:{avg_loss:.4f} | "
+            msg = (f"SS-RF E{epoch:3d}/{args.epochs} | Loss:{avg_loss:.4f} | "
                    f"PSNR:{val_psnr:.2f} (Best:{best_psnr:.2f}) | "
                    f"LR:{current_lr:.1e} | {elapsed/60:.1f}min | GPU:{mem:.2f}GB{improved}")
             write_progress(msg)
@@ -442,16 +516,16 @@ def main():
 
         torch.save({
             'epoch': epoch,
-            'model_state_dict': model_hgm.state_dict(),
+            'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'psnr': best_psnr,
             'loss': avg_loss,
             'baseline_psnr': baseline_psnr,
-        }, os.path.join(args.save_dir, f'GP_HGM_plus_latest_{args.model_scale}.pth'))
+        }, os.path.join(args.save_dir, f'SS_RF_latest_{args.model_scale}.pth'))
 
     total_time = time.time() - train_start
-    write_progress(f"GP-HGM++ training completed! Time: {total_time/60:.1f}min | Best PSNR: {best_psnr:.2f} dB")
+    write_progress(f"SS-RF training completed! Time: {total_time/60:.1f}min | Best PSNR: {best_psnr:.2f} dB")
     write_progress("ALL DONE!")
 
 if __name__ == '__main__':

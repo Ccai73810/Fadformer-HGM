@@ -32,10 +32,7 @@ class FiLM_Layer(nn.Module):
     """
     def __init__(self, latent_dim, feature_dim):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(latent_dim, feature_dim * 2),
-            nn.ReLU(inplace=True)
-        )
+        self.fc = nn.Linear(latent_dim, feature_dim * 2)
         
     def forward(self, x, z):
         # z: B, latent_dim
